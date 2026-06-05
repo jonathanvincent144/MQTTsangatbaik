@@ -5,6 +5,7 @@
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import mqtt from "mqtt";
+import * as Ably from "ably";
 import { Cpu, Wifi, Radio, Server, MessageSquare, Plus, Check } from "lucide-react";
 import { BrokerConfig, RelayState, SensorRecord, ActivityLog } from "./types";
 import { SensoryPanel } from "./components/SensoryPanel";
@@ -12,7 +13,6 @@ import { RelayStatusPanel } from "./components/RelayStatusPanel";
 import { BrokerConfigPanel } from "./components/BrokerConfigPanel";
 import { VoiceControlPanel } from "./components/VoiceControlPanel";
 import { ActivityLogPanel } from "./components/ActivityLogPanel";
-import { AblyMqttBridge } from "./utils/AblyMqttBridge";
 
 const DEFAULT_BROKERS: BrokerConfig[] = [
   {
@@ -162,174 +162,385 @@ export default function App() {
     setConnectionStatus("connecting");
     addLog(`Menghubungkan ke ${broker.name}...`, "info", "system");
 
-    // Construct WebSocket client URL
-    const wsUrl = `wss://${broker.server}:${broker.wsPort}${broker.wsPath}`;
-    
-    // Configure username & password according to broker provider requirements
-    let username = broker.user;
-    let password = broker.pass;
-
-    if (broker.server.includes("ably")) {
-      // Ably basic authentication requires the full API key as the username, and the password MUST be left empty or blank
-      username = `${broker.user}:${broker.pass}`;
-      password = "";
-    } else if (broker.vhost && broker.vhost.trim() !== "") {
-      // CloudAMQP (RabbitMQ) requires user:pass logins with strict vhost formatting
-      username = `${broker.vhost}:${broker.user}`;
-    }
-
     // Use exactly "WebClient" as the clientId for Broker 3. For others, give a randomized suffix to avoid client_id collision with the physical ESP32.
     const clientId = broker.client_id === "WebClient" || activeIndex === 2
       ? "WebClient"
       : `${broker.client_id}_Web_${Math.random().toString(16).substring(2, 6)}`;
 
-    const clientOptions = {
-      clientId,
-      username,
-      password,
-      keepalive: 60,
-      clean: true,          // Force clean session to discard any stored QoS 1 or QoS 2 packet handshaking residues
-      cleanSession: true,   // Backwards compatibility with standard WebSocket gateways
-      protocolVersion: 4 as const, // Explicitly use MQTT v3.1.1 to bypass MQTT v5 packet handshake irregularities
-      reconnectPeriod: 5000, // Try to reconnect every 5s if drops
-      connectTimeout: 10 * 1000,
-    };
+    // Condition based on active index or url
+    if (broker.server.includes("ably") || activeIndex === 1) {
+      addLog(`Menghubungkan menggunakan Ably Realtime SDK...`, "info", "system");
 
-    try {
-      let client;
-      if (broker.server.includes("ably")) {
+      try {
         const apiKey = `${broker.user}:${broker.pass}`;
-        client = new AblyMqttBridge(apiKey);
-      } else {
-        client = mqtt.connect(wsUrl, clientOptions);
-      }
-      mqttClientRef.current = client;
+        const ably = new Ably.Realtime({
+          key: apiKey,
+          clientId: clientId,
+          autoConnect: true,
+        });
 
-      client.on("connect", () => {
-        setConnectionStatus("connected");
-        addLog(`Koneksi Sukses! Terbuka pada URI: ${broker.server}`, "success", "system");
+        // Event mechanism wrapper
+        const callbacks = new Map<string, Set<(...args: any[]) => void>>();
+        
+        const on = (event: string, callback: (...args: any[]) => void) => {
+          if (!callbacks.has(event)) {
+            callbacks.set(event, new Set());
+          }
+          callbacks.get(event)!.add(callback);
+        };
 
-        // Subscribe to standard telemetry, controls, and active broker statuses (forced to QoS 0)
-        client.subscribe([
-          "sensor/suhu",
-          "sensor/kelembaban",
-          "status/broker",
-          "kontrol/relay1",
-          "kontrol/relay2",
-          "kontrol/relay3",
-          "kontrol/relay4",
-          "kontrol/variasi",
-          "kontrol/broker",
-        ], { qos: 0 }, (err) => {
-          if (!err) {
-            addLog("Berhasil mendengarkan semua topik sensor & kontrol.", "success", "system");
-          } else {
-            addLog("Gagal langganan topik: " + err.message, "warn", "system");
+        const emit = (event: string, ...args: any[]) => {
+          if (callbacks.has(event)) {
+            callbacks.get(event)!.forEach((cb) => cb(...args));
+          }
+        };
+
+        const subscribedChannels = new Map<string, Ably.RealtimeChannel>();
+
+        const subscribe = (topics: string[], options?: any, callback?: (err?: any) => void) => {
+          topics.forEach((topic) => {
+            const channelName = topic.replace(/\//g, ":");
+            const channel = ably.channels.get(channelName);
+            subscribedChannels.set(topic, channel);
+
+            channel.subscribe((msg) => {
+              const rawData = msg.data;
+              let payloadStr = "";
+              if (typeof rawData === "string") {
+                payloadStr = rawData;
+              } else if (rawData instanceof ArrayBuffer || ArrayBuffer.isView(rawData)) {
+                payloadStr = new TextDecoder().decode(rawData as any);
+              } else if (rawData !== undefined && rawData !== null) {
+                payloadStr = JSON.stringify(rawData);
+              }
+              emit("message", topic, { toString: () => payloadStr });
+            });
+          });
+
+          if (callback) {
+            setTimeout(() => callback(), 50);
+          }
+        };
+
+        const publish = (topic: string, message: string, options?: any, callback?: any) => {
+          let actualCallback = callback;
+          if (typeof options === "function") {
+            actualCallback = options;
+          }
+
+          const channelName = topic.replace(/\//g, ":");
+          const channel = ably.channels.get(channelName);
+          
+          (channel as any).publish("message", message, (err: any) => {
+            if (actualCallback) {
+              actualCallback(err);
+            }
+          });
+        };
+
+        const end = (force?: boolean, options?: any, cb?: any) => {
+          subscribedChannels.forEach((channel) => {
+            try {
+              channel.unsubscribe();
+            } catch (e) {
+              console.warn("Unsubscribe error:", e);
+            }
+          });
+          subscribedChannels.clear();
+
+          try {
+            ably.close();
+          } catch (e) {
+            console.warn("Ably close error:", e);
+          }
+
+          emit("close");
+          if (cb) cb();
+        };
+
+        ably.connection.on("connected", () => {
+          emit("connect");
+        });
+
+        ably.connection.on("failed", (stateChange) => {
+          const errMsg = stateChange?.reason?.message || "Koneksi Ably gagal.";
+          emit("error", new Error(errMsg));
+        });
+
+        ably.connection.on("disconnected", () => {
+          emit("close");
+        });
+
+        const client = {
+          on,
+          subscribe,
+          publish,
+          end,
+        };
+
+        mqttClientRef.current = client;
+
+        client.on("connect", () => {
+          setConnectionStatus("connected");
+          addLog(`Koneksi Sukses! Terbuka pada Ably Realtime Enterprise Broker`, "success", "system");
+
+          // Subscribe telemetry
+          client.subscribe([
+            "sensor/suhu",
+            "sensor/kelembaban",
+            "status/broker",
+            "kontrol/relay1",
+            "kontrol/relay2",
+            "kontrol/relay3",
+            "kontrol/relay4",
+            "kontrol/variasi",
+            "kontrol/broker",
+          ], { qos: 0 }, (err) => {
+            if (!err) {
+              addLog("Berhasil mendengarkan semua topik sensor & kontrol menggunakan Ably SDK.", "success", "system");
+            } else {
+              addLog("Ably: Gagal langganan topik: " + err.message, "warn", "system");
+            }
+          });
+        });
+
+        client.on("message", (topic, payload) => {
+          const message = payload.toString().trim();
+
+          // 1. Temperature Telemetry
+          if (topic === "sensor/suhu") {
+            const val = parseFloat(message);
+            if (!isNaN(val)) {
+              setCurrentTemp(val);
+              setLastUpdate(new Date());
+              setSensorHistory((prev) => {
+                const newRecord: SensorRecord = {
+                  timestamp: new Date().toISOString(),
+                  suhu: val,
+                  kelembaban: currentHumidityRef.current || 0,
+                  broker: broker.name,
+                };
+                return [...prev, newRecord].slice(-15);
+              });
+              addLog(`Suhu terupdate: ${val.toFixed(1)}°C`, "sensor", "esp32");
+            }
+          }
+
+          // 2. Humidity Telemetry
+          else if (topic === "sensor/kelembaban") {
+            const val = parseFloat(message);
+            if (!isNaN(val)) {
+              setCurrentHumidity(val);
+              setLastUpdate(new Date());
+              addLog(`Kelembaban terupdate: ${val.toFixed(1)}%`, "sensor", "esp32");
+            }
+          }
+
+          // 3. Physical ESP32 Target Broker Confirmation
+          else if (topic === "status/broker") {
+            setActiveBrokerIP(message);
+            addLog(`Alat fisik melaporkan status koneksi: "${message}"`, "info", "esp32");
+          }
+
+          // 4. Synchronization of Controls (if changed by another browser/voice command)
+          else if (topic === "kontrol/variasi") {
+            if (message === "1") {
+              setVariasiMode(1);
+              addLog("Sinkronisasi: Variasi Mode 1 diaktifkan.", "info", "esp32");
+            } else if (message === "2") {
+              setVariasiMode(2);
+              addLog("Sinkronisasi: Variasi Mode 2 diaktifkan.", "info", "esp32");
+            } else if (message === "STOP") {
+              setVariasiMode(0);
+              addLog("Sinkronisasi: Variasi dihentikan. Kembali ke manual.", "success", "esp32");
+            }
+          } 
+          
+          else if (topic.startsWith("kontrol/relay")) {
+            const matchIdx = topic.match(/kontrol\/relay(\d)/);
+            if (matchIdx) {
+              const num = parseInt(matchIdx[1], 10);
+              const isOn = message === "ON";
+              setRelayState((prev) => {
+                const stateKey = `relay${num}` as keyof RelayState;
+                return { ...prev, [stateKey]: isOn };
+              });
+              addLog(`Sinkronisasi: Switch Relay ${num} dipicu ke [${message}]`, "info", "esp32");
+            }
           }
         });
-      });
 
-      client.on("message", (topic, payload) => {
-        const message = payload.toString().trim();
+        client.on("error", (err) => {
+          setConnectionStatus("failed");
+          addLog(`Peringatan Ably: ${err.message}`, "warn", "system");
+        });
 
-        // 1. Temperature Telemetry
-        if (topic === "sensor/suhu") {
-          const val = parseFloat(message);
-          if (!isNaN(val)) {
-            setCurrentTemp(val);
-            setLastUpdate(new Date());
-            setSensorHistory((prev) => {
-              const newRecord: SensorRecord = {
-                timestamp: new Date().toISOString(),
-                suhu: val,
-                kelembaban: currentHumidityRef.current || 0,
-                broker: broker.name,
-              };
-              return [...prev, newRecord].slice(-15); // visual cap 15 on current browser trend
-            });
-            addLog(`Suhu terupdate: ${val.toFixed(1)}°C`, "sensor", "esp32");
-          }
-        }
+        client.on("close", () => {
+          setConnectionStatus("disconnected");
+          addLog("Koneksi Ably ditutup.", "info", "system");
+        });
 
-        // 2. Humidity Telemetry
-        else if (topic === "sensor/kelembaban") {
-          const val = parseFloat(message);
-          if (!isNaN(val)) {
-            setCurrentHumidity(val);
-            setLastUpdate(new Date());
-            addLog(`Kelembaban terupdate: ${val.toFixed(1)}%`, "sensor", "esp32");
-          }
-        }
-
-        // 3. Physical ESP32 Target Broker Confirmation
-        else if (topic === "status/broker") {
-          // Payload format: BROKER:1|kingfisher.lmq.cloudamqp.com
-          setActiveBrokerIP(message);
-          addLog(`Alat fisik melaporkan status koneksi: "${message}"`, "info", "esp32");
-        }
-
-        // 4. Synchronization of Controls (if changed by another browser/voice command)
-        else if (topic === "kontrol/variasi") {
-          if (message === "1") {
-            setVariasiMode(1);
-            addLog("Sinkronisasi: Variasi Mode 1 diaktifkan.", "info", "esp32");
-          } else if (message === "2") {
-            setVariasiMode(2);
-            addLog("Sinkronisasi: Variasi Mode 2 diaktifkan.", "info", "esp32");
-          } else if (message === "STOP") {
-            setVariasiMode(0);
-            addLog("Sinkronisasi: Variasi dihentikan. Kembali ke manual.", "success", "esp32");
-          }
-        } 
-        
-        else if (topic.startsWith("kontrol/relay")) {
-          const matchIdx = topic.match(/kontrol\/relay(\d)/);
-          if (matchIdx) {
-            const num = parseInt(matchIdx[1], 10);
-            const isOn = message === "ON";
-            setRelayState((prev) => {
-              const stateKey = `relay${num}` as keyof RelayState;
-              return { ...prev, [stateKey]: isOn };
-            });
-            addLog(`Sinkronisasi: Switch Relay ${num} dipicu ke [${message}]`, "info", "esp32");
-          }
-        }
-      });
-
-      client.on("error", (err) => {
+      } catch (err: any) {
+        console.error(err);
         setConnectionStatus("failed");
-        const errMsg = err.message || "";
-        const isHeaderFlagErr = errMsg.toLowerCase().includes("header flag bits") || 
-                                errMsg.toLowerCase().includes("both qos bits") || 
-                                errMsg.toLowerCase().includes("qos") || 
-                                errMsg.toLowerCase().includes("pubcomp");
+        addLog("Gagal instansiasi Ably Realtime: " + err.message, "warn", "system");
+      }
 
-        if (isHeaderFlagErr) {
-          console.warn("MQTT Handled Protocol Warning:", errMsg);
-          addLog(`Kesalahan Protokol (QoS / Flag Bits): Terdeteksi perilaku paket non-standar di broker ini. Mencoba menghubungkan kembali otomatis...`, "warn", "system");
-        } else if (errMsg.toLowerCase().includes("not authorized") || errMsg.toLowerCase().includes("credentials") || errMsg.toLowerCase().includes("auth")) {
-          console.warn("MQTT Auth Warning:", err);
-          addLog(`Gagal Otorisasi: Username atau Password salah untuk broker ini. Silakan periksa & perbarui rincian login di panel kiri.`, "warn", "system");
-          try {
-            client.end(true); // Force end connection and clear reconnect timers of the unauthorized broker client
-          } catch (e) {
-            console.warn("Gagal menutup client setelah deotorisasi:", e);
+    } else {
+      // Construct WebSocket client URL
+      const wsUrl = `wss://${broker.server}:${broker.wsPort}${broker.wsPath}`;
+      
+      // Configure username & password according to broker provider requirements
+      let username = broker.user;
+      let password = broker.pass;
+
+      if (broker.vhost && broker.vhost.trim() !== "") {
+        // CloudAMQP (RabbitMQ) requires user:pass logins with strict vhost formatting
+        username = `${broker.vhost}:${broker.user}`;
+      }
+
+      const clientOptions = {
+        clientId,
+        username,
+        password,
+        keepalive: 60,
+        clean: true,          // Force clean session to discard any stored QoS 1 or QoS 2 packet handshaking residues
+        cleanSession: true,   // Backwards compatibility with standard WebSocket gateways
+        protocolVersion: 4 as const, // Explicitly use MQTT v3.1.1 to bypass MQTT v5 packet handshake irregularities
+        reconnectPeriod: 5000, // Try to reconnect every 5s if drops
+        connectTimeout: 10 * 1000,
+      };
+
+      try {
+        const client = mqtt.connect(wsUrl, clientOptions);
+        mqttClientRef.current = client;
+
+        client.on("connect", () => {
+          setConnectionStatus("connected");
+          addLog(`Koneksi Sukses! Terbuka pada URI: ${broker.server}`, "success", "system");
+
+          // Subscribe to standard telemetry, controls, and active broker statuses (forced to QoS 0)
+          client.subscribe([
+            "sensor/suhu",
+            "sensor/kelembaban",
+            "status/broker",
+            "kontrol/relay1",
+            "kontrol/relay2",
+            "kontrol/relay3",
+            "kontrol/relay4",
+            "kontrol/variasi",
+            "kontrol/broker",
+          ], { qos: 0 }, (err) => {
+            if (!err) {
+              addLog("Berhasil mendengarkan semua topik sensor & kontrol.", "success", "system");
+            } else {
+              addLog("Gagal langganan topik: " + err.message, "warn", "system");
+            }
+          });
+        });
+
+        client.on("message", (topic, payload) => {
+          const message = payload.toString().trim();
+
+          // 1. Temperature Telemetry
+          if (topic === "sensor/suhu") {
+            const val = parseFloat(message);
+            if (!isNaN(val)) {
+              setCurrentTemp(val);
+              setLastUpdate(new Date());
+              setSensorHistory((prev) => {
+                const newRecord: SensorRecord = {
+                  timestamp: new Date().toISOString(),
+                  suhu: val,
+                  kelembaban: currentHumidityRef.current || 0,
+                  broker: broker.name,
+                };
+                return [...prev, newRecord].slice(-15); // visual cap 15 on current browser trend
+              });
+              addLog(`Suhu terupdate: ${val.toFixed(1)}°C`, "sensor", "esp32");
+            }
           }
-        } else {
-          console.warn("MQTT Connection Warning:", err);
-          addLog(`Peringatan: Gagal terhubung ke MQTT websocket (${errMsg}). Periksa keamanan port sertifikat SSL Anda.`, "warn", "system");
-        }
-      });
 
-      client.on("close", () => {
-        setConnectionStatus("disconnected");
-        addLog("Koneksi ditutup.", "info", "system");
-      });
+          // 2. Humidity Telemetry
+          else if (topic === "sensor/kelembaban") {
+            const val = parseFloat(message);
+            if (!isNaN(val)) {
+              setCurrentHumidity(val);
+              setLastUpdate(new Date());
+              addLog(`Kelembaban terupdate: ${val.toFixed(1)}%`, "sensor", "esp32");
+            }
+          }
 
-    } catch (error: any) {
-      console.error(error);
-      setConnectionStatus("failed");
-      addLog("Gagal instansiasi client MQTT: " + error.message, "warn", "system");
+          // 3. Physical ESP32 Target Broker Confirmation
+          else if (topic === "status/broker") {
+            // Payload format: BROKER:1|kingfisher.lmq.cloudamqp.com
+            setActiveBrokerIP(message);
+            addLog(`Alat fisik melaporkan status koneksi: "${message}"`, "info", "esp32");
+          }
+
+          // 4. Synchronization of Controls (if changed by another browser/voice command)
+          else if (topic === "kontrol/variasi") {
+            if (message === "1") {
+              setVariasiMode(1);
+              addLog("Sinkronisasi: Variasi Mode 1 diaktifkan.", "info", "esp32");
+            } else if (message === "2") {
+              setVariasiMode(2);
+              addLog("Sinkronisasi: Variasi Mode 2 diaktifkan.", "info", "esp32");
+            } else if (message === "STOP") {
+              setVariasiMode(0);
+              addLog("Sinkronisasi: Variasi dihentikan. Kembali ke manual.", "success", "esp32");
+            }
+          } 
+          
+          else if (topic.startsWith("kontrol/relay")) {
+            const matchIdx = topic.match(/kontrol\/relay(\d)/);
+            if (matchIdx) {
+              const num = parseInt(matchIdx[1], 10);
+              const isOn = message === "ON";
+              setRelayState((prev) => {
+                const stateKey = `relay${num}` as keyof RelayState;
+                return { ...prev, [stateKey]: isOn };
+              });
+              addLog(`Sinkronisasi: Switch Relay ${num} dipicu ke [${message}]`, "info", "esp32");
+            }
+          }
+        });
+
+        client.on("error", (err) => {
+          setConnectionStatus("failed");
+          const errMsg = err.message || "";
+          const isHeaderFlagErr = errMsg.toLowerCase().includes("header flag bits") || 
+                                  errMsg.toLowerCase().includes("both qos bits") || 
+                                  errMsg.toLowerCase().includes("qos") || 
+                                  errMsg.toLowerCase().includes("pubcomp");
+
+          if (isHeaderFlagErr) {
+            console.warn("MQTT Handled Protocol Warning:", errMsg);
+            addLog(`Kesalahan Protokol (QoS / Flag Bits): Terdeteksi perilaku paket non-standar di broker ini. Mencoba menghubungkan kembali otomatis...`, "warn", "system");
+          } else if (errMsg.toLowerCase().includes("not authorized") || errMsg.toLowerCase().includes("credentials") || errMsg.toLowerCase().includes("auth")) {
+            console.warn("MQTT Auth Warning:", err);
+            addLog(`Gagal Otorisasi: Username atau Password salah untuk broker ini. Silakan periksa & perbarui rincian login di panel kiri.`, "warn", "system");
+            try {
+              client.end(true); // Force end connection and clear reconnect timers of the unauthorized broker client
+            } catch (e) {
+              console.warn("Gagal menutup client setelah deotorisasi:", e);
+            }
+          } else {
+            console.warn("MQTT Connection Warning:", err);
+            addLog(`Peringatan: Gagal terhubung ke MQTT websocket (${errMsg}). Periksa keamanan port sertifikat SSL Anda.`, "warn", "system");
+          }
+        });
+
+        client.on("close", () => {
+          setConnectionStatus("disconnected");
+          addLog("Koneksi ditutup.", "info", "system");
+        });
+
+      } catch (error: any) {
+        console.error(error);
+        setConnectionStatus("failed");
+        addLog("Gagal instansiasi client MQTT: " + error.message, "warn", "system");
+      }
     }
   }, [brokers, activeIndex, addLog]);
 
@@ -393,10 +604,10 @@ export default function App() {
         addLog(`Browser aktif beralih ke Broker ${idx + 1}...`, "info", "system");
       };
 
-      // 800ms fallback/guarantee timer so we don't block the UI forever
+      // 1500ms fallback/guarantee timer so we don't block the UI forever
       const fallbackTimer = setTimeout(() => {
         transitionToNewBroker();
-      }, 800);
+      }, 1500);
 
       try {
         mqttClientRef.current.publish("kontrol/broker", String(idx + 1), { qos: 0 }, (err: any) => {
@@ -406,8 +617,8 @@ export default function App() {
           } else {
             addLog(`Perintah beralih berhasil terkirim. Mengizinkan jeda transmisi WiFi...`, "success", "system");
           }
-          // Brief 200ms additional breathing room for buffer flush before closing client
-          setTimeout(transitionToNewBroker, 200);
+          // Extra 500ms additional breathing room for buffer flush before closing client
+          setTimeout(transitionToNewBroker, 500);
         });
       } catch (err: any) {
         clearTimeout(fallbackTimer);
