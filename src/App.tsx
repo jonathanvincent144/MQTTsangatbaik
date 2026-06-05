@@ -382,14 +382,42 @@ export default function App() {
   const handleSelectBroker = useCallback((idx: number) => {
     if (idx === activeIndex) return;
 
-    // Trigger broker shift over MQTT to alert physical ESP32 to shift as well!
     if (mqttClientRef.current && connectionStatus === "connected") {
-      mqttClientRef.current.publish("kontrol/broker", String(idx + 1), { qos: 0 });
-      addLog(`Mengirimkan perintah pensaklaran broker fisik ke: Broker ${idx + 1}`, "command", "web");
-    }
+      addLog(`Menghubungi alat fisik untuk beralih ke Broker ${idx + 1}...`, "command", "web");
+      
+      let hasTransitioned = false;
+      const transitionToNewBroker = () => {
+        if (hasTransitioned) return;
+        hasTransitioned = true;
+        setActiveIndex(idx);
+        addLog(`Browser aktif beralih ke Broker ${idx + 1}...`, "info", "system");
+      };
 
-    setActiveIndex(idx);
-    addLog(`Mengganti browser aktif ke Broker ${idx + 1}...`, "info", "system");
+      // 800ms fallback/guarantee timer so we don't block the UI forever
+      const fallbackTimer = setTimeout(() => {
+        transitionToNewBroker();
+      }, 800);
+
+      try {
+        mqttClientRef.current.publish("kontrol/broker", String(idx + 1), { qos: 0 }, (err: any) => {
+          clearTimeout(fallbackTimer);
+          if (err) {
+            addLog(`Gagal mengirim sinyal beralih ke ESP32: ${err.message || err}`, "warn", "system");
+          } else {
+            addLog(`Perintah beralih berhasil terkirim. Mengizinkan jeda transmisi WiFi...`, "success", "system");
+          }
+          // Brief 200ms additional breathing room for buffer flush before closing client
+          setTimeout(transitionToNewBroker, 200);
+        });
+      } catch (err: any) {
+        clearTimeout(fallbackTimer);
+        addLog(`Pengecualian saat mengirim perintah beralih: ${err.message || err}`, "warn", "system");
+        transitionToNewBroker();
+      }
+    } else {
+      setActiveIndex(idx);
+      addLog(`Mengganti browser aktif ke Broker ${idx + 1}...`, "info", "system");
+    }
   }, [activeIndex, connectionStatus, addLog]);
 
   const handleUpdateBroker = useCallback((idx: number, updated: BrokerConfig) => {
