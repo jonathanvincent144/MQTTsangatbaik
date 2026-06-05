@@ -1,0 +1,8 @@
+{
+  "name": "ESP32 MQTT Relay Dashboard",
+  "description": "Smart IoT relay board and sensor logger interface utilizing MQTT WebSockets, natural language voice command parsing with Gemini, and real-time logs.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
